@@ -1,0 +1,126 @@
+name: CT3CY full image
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Board defconfig'
+        required: true
+        default: 'ssc335_lite'
+        type: choice
+        options:
+          - ssc335_lite
+          - ssc335_ultimate
+
+jobs:
+  firmware:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ ssc335_lite ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake autotools-dev bc build-essential cpio curl file git \
+            libncurses-dev libtool lzop make rsync unzip wget libssl-dev
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ccache
+          key: ${{ matrix.platform }}-${{ hashFiles('br-ext-chip-*/configs/**', 'general/**') }}
+          restore-keys: |
+            ${{ matrix.platform }}-
+
+      - name: Build firmware
+        run: |
+          mkdir -p /tmp/ccache
+          ln -s /tmp/ccache ${HOME}/.ccache
+          make BOARD=${{ matrix.platform }} 2>&1 | tee build.log
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          ls -la output/images/ || true
+          cp output/images/uImage.* out/ 2>/dev/null || true
+          cp output/images/rootfs.squashfs.* out/ 2>/dev/null || true
+          cp output/images/openipc.*.tgz out/ 2>/dev/null || true
+          echo "=== collected ==="
+          ls -la out/
+
+      - name: Assemble full 8MB image
+        if: matrix.platform == 'ssc335_lite'
+        run: |
+          set -e
+          ls -la out/
+          # U-Boot for ssc335 NOR
+          wget -nv -O /tmp/uboot.bin \
+            "https://github.com/openipc/firmware/releases/download/latest/u-boot-ssc335-nor.bin" \
+            || wget -nv -O /tmp/uboot.bin \
+            "https://github.com/TalusL/OpenIPC-CT3CY/releases/download/latest/u-boot-ssc335-nor.bin"
+          ls -l /tmp/uboot.bin
+
+          # 8 MiB total flash. Layout (OpenIPC standard 8MB):
+          #   0x000000  u-boot          (256 KiB max)
+          #   0x050000  uImage          (2048 KiB max)
+          #   0x250000  rootfs.squashfs (5120 KiB max) -> ends 0x750000
+          # fill remainder with 0xFF up to 0x800000
+          python3 - <<'PY'
+          import os, sys
+          TOTAL   = 8 * 1024 * 1024      # 0x800000
+          BOOT    = 0 * 1024 * 1024
+          KERNEL  = 0x050000
+          ROOTFS  = 0x250000
+          END     = 0x750000
+
+          img = bytearray(b'\xff' * TOTAL)
+
+          def put(path, off, limit):
+              data = open(path, 'rb').read()
+              if len(data) > limit:
+                  sys.exit(f"{path} too big: {len(data)} > {limit}")
+              img[off:off+len(data)] = data
+              print(f"  {os.path.basename(path):40s} @ 0x{off:06X}  {len(data):8d} bytes")
+
+          put('/tmp/uboot.bin', BOOT, KERNEL - BOOT)
+          put('out/uImage.ssc335', KERNEL, ROOTFS - KERNEL)
+          put('out/rootfs.squashfs.ssc335', ROOTFS, END - ROOTFS)
+
+          open('out/openipc-CT3CY-full.bin', 'wb').write(img)
+          print(f"total: {len(img)} bytes (0x{len(img):X})")
+          PY
+
+      - name: Verify image
+        if: matrix.platform == 'ssc335_lite'
+        run: |
+          F=out/openipc-CT3CY-full.bin
+          ls -l $F
+          echo "--- magic checks ---"
+          echo -n "uImage magic @0x50000: "; dd if=$F bs=1 skip=$((0x50000)) count=4 2>/dev/null | xxd -p
+          echo -n "squashfs   @0x250000: "; dd if=$F bs=1 skip=$((0x250000)) count=4 2>/dev/null | xxd -p
+          python3 - <<'PY'
+          d = open('out/openipc-CT3CY-full.bin','rb').read()
+          assert len(d) == 8*1024*1024, len(d)
+          assert b'hsqs' in d[0x250000:0x250100], 'rootfs squashfs magic missing'
+          print("image OK:", len(d), "bytes")
+          PY
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: openipc-CT3CY-${{ matrix.platform }}
+          path: |
+            out/openipc-CT3CY-full.bin
+            out/openipc.*.tgz
+          if-no-files-found: warn
+          retention-days: 30
